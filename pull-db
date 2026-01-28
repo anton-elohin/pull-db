@@ -1,0 +1,185 @@
+#!/bin/bash
+
+# Проверяем наличие yq и устанавливаем при необходимости
+if ! command -v yq &> /dev/null; then
+    echo "❌ yq не установлен, пытаюсь установить..."
+    ddev install-system-dep yq
+fi
+
+# Путь к конфигу
+CONFIG_FILE=".ddev/config.remote.yaml"
+
+# Проверяем существование конфига
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "❌ Файл конфигурации $CONFIG_FILE не найден!"
+    exit 1
+fi
+
+# Определяем окружение
+if [ -z "$1" ]; then
+    # Если окружение не указано, берем первое из списка
+    ENVIRONMENT=$(yq e '.environments | keys | .[0]' "$CONFIG_FILE")
+
+    if [ -z "$ENVIRONMENT" ]; then
+        echo "❌ В конфиге не найдено ни одного окружения!"
+        exit 1
+    fi
+
+    echo "ℹ️ Окружение не указано, используется первое: $ENVIRONMENT"
+else
+    ENVIRONMENT="$1"
+fi
+
+# Проверяем существование окружения в конфиге
+if ! yq e ".environments.$ENVIRONMENT" "$CONFIG_FILE" | grep -vq 'null'; then
+    AVAILABLE_ENVS=$(yq e '.environments | keys | join(", ")' "$CONFIG_FILE")
+    echo "❌ Окружение '$ENVIRONMENT' не найдено в конфиге"
+    echo "   Доступные окружения: $AVAILABLE_ENVS"
+    exit 1
+fi
+
+# Извлекаем данные для окружения
+HOST=$(yq e ".environments.$ENVIRONMENT.host" "$CONFIG_FILE")
+SSH_PORT=$(yq e ".environments.$ENVIRONMENT.ssh_port" "$CONFIG_FILE")
+USERNAME=$(yq e ".environments.$ENVIRONMENT.username" "$CONFIG_FILE")
+SSH_PASSWORD=$(yq e ".environments.$ENVIRONMENT.ssh_password" "$CONFIG_FILE")
+PROJECT_ROOT=$(yq e ".environments.$ENVIRONMENT.project_root" "$CONFIG_FILE")
+
+DB_HOST=$(yq e ".environments.$ENVIRONMENT.database.host // \"localhost\"" "$CONFIG_FILE")
+DB_PORT=$(yq e ".environments.$ENVIRONMENT.database.port // 3306" "$CONFIG_FILE")
+DB_NAME=$(yq e ".environments.$ENVIRONMENT.database.name" "$CONFIG_FILE")
+DB_USER=$(yq e ".environments.$ENVIRONMENT.database.login" "$CONFIG_FILE")
+DB_PASS=$(yq e ".environments.$ENVIRONMENT.database.password" "$CONFIG_FILE")
+
+# Проверяем необходимость использования sshpass ТОЛЬКО ЕСЛИ УКАЗАН ПАРОЛЬ
+if [[ -n "$SSH_PASSWORD" && "$SSH_PASSWORD" != "null" ]]; then
+    if [[ "$OS" == "MINGW"* || "$OS" == "MSYS"* || "$OS" == "CYGWIN"* ]]; then
+        echo "❌ Использование SSH-пароля не поддерживается на Windows!"
+        exit 1
+    fi
+
+    # Проверяем наличие sshpass только если требуется
+    if ! command -v sshpass &> /dev/null; then
+        echo "❌ sshpass не установлен, пытаюсь установить..."
+        
+        # Функция для установки sshpass
+        install_sshpass() {
+            ddev install-system-dep sshpass
+        }
+        
+        install_sshpass
+        if ! command -v sshpass &> /dev/null; then
+            echo "❌ Не удалось установить sshpass!"
+            exit 1
+        fi
+    fi
+fi
+
+# Получаем список игнорируемых таблиц
+IGNORE_TABLES=($(yq e ".environments.$ENVIRONMENT.ignore_tables | .[]" "$CONFIG_FILE"))
+IGNORE_TABLES_FORCE=($(yq e ".environments.$ENVIRONMENT.ignore_tables_force | .[]" "$CONFIG_FILE"))
+
+# Формируем строку с --ignore-table
+ignore_flags=""
+for table in "${IGNORE_TABLES[@]}" "${IGNORE_TABLES_FORCE[@]}"; do
+    ignore_flags+="--ignore-table=${DB_NAME}.${table} "
+done
+
+# Формируем команду mysqldump для основных данных (БЕЗ исключенных таблиц)
+DUMP_CMD="mysqldump \
+        --no-tablespaces \
+        -h $DB_HOST -P $DB_PORT -u $DB_USER -p'$DB_PASS' \
+        --single-transaction --quick $ignore_flags $DB_NAME"
+
+# Создаем временный файл для основного дампа
+MAIN_DUMP=$(mktemp).sql
+
+# Выполняем команду для получения основного дампа
+echo "🔄 Запуск дампа для окружения $ENVIRONMENT..."
+echo "🔗 SSH: $USERNAME@$HOST:$SSH_PORT"
+echo "🔑 Используется пароль SSH: $( [[ -n "$SSH_PASSWORD" && "$SSH_PASSWORD" != "null" ]] && echo "да" || echo "нет" )"
+echo "📁 Путь: $PROJECT_ROOT"
+echo "⚙️ Параметры DB: $DB_USER@$DB_HOST/$DB_NAME"
+echo "🚫 Игнорируемые таблицы: ${IGNORE_TABLES[*]}"
+echo "🚫 Игнорируемые (без структуры): ${IGNORE_TABLES_FORCE[*]}"
+
+# Функция для выполнения SSH-команды с обработкой пароля
+run_ssh() {
+    local cmd="$1"
+    if [[ -n "$SSH_PASSWORD" && "$SSH_PASSWORD" != "null" ]]; then
+        SSHPASS="$SSH_PASSWORD" sshpass -e ssh -p "$SSH_PORT" "$USERNAME@$HOST" "$cmd"
+    else
+        ssh -p "$SSH_PORT" "$USERNAME@$HOST" "$cmd"
+    fi
+}
+
+# Выполняем дамп через SSH
+run_ssh "cd $PROJECT_ROOT && $DUMP_CMD" > "$MAIN_DUMP"
+
+# Проверяем успешность
+if [ $? -ne 0 ] || [ ! -s "$MAIN_DUMP" ]; then
+    echo "❌ Ошибка при создании основного дампа!"
+    rm -f "$MAIN_DUMP"
+    exit 1
+fi
+
+# Импортируем основную базу
+echo "📥 Импортируем основную базу в DDEV (размер: $(du -h "$MAIN_DUMP" | cut -f1))..."
+ddev import-db --src="$MAIN_DUMP"
+rm -f "$MAIN_DUMP"
+
+# Создаем пустые структуры для игнорируемых таблиц
+if [ ${#IGNORE_TABLES[@]} -ne 0 ]; then
+    echo "🛠️ Создаем пустые структуры для игнорируемых таблиц..."
+
+    # Создаем временный файл для SQL-структур
+    STRUCTURE_FILE=$(mktemp).sql
+
+    # Добавляем заголовок SQL
+    {
+    echo "SET SESSION sql_mode = 'NO_AUTO_VALUE_ON_ZERO';"
+    echo "SET FOREIGN_KEY_CHECKS=0;"
+    } > "$STRUCTURE_FILE"
+
+    # Генерируем SQL для создания пустых таблиц
+    for table in "${IGNORE_TABLES[@]}"; do
+        echo "🔧 Таблица: $table"
+
+        # Получаем структуру таблицы с удаленного сервера
+        CREATE_CMD="mysqldump --no-tablespaces -h $DB_HOST -P $DB_PORT -u $DB_USER -p'$DB_PASS' \
+                    --no-data --skip-lock-tables --compact --skip-add-drop-table $DB_NAME $table"
+
+        if [[ "$OS" == "MINGW"* || "$OS" == "MSYS"* || "$OS" == "CYGWIN"* ]]; then
+            ssh.exe -p "$SSH_PORT" "$USERNAME@$HOST" "cd $PROJECT_ROOT && $CREATE_CMD" | \
+            sed -e 's/AUTO_INCREMENT=[0-9]*\b//g' \
+                -e 's/^\/\*![0-9]\{5\}.*\/;$//g' \
+                -e 's/CREATE TABLE/CREATE TABLE IF NOT EXISTS/' \
+            >> "$STRUCTURE_FILE"
+        else
+            run_ssh "cd $PROJECT_ROOT && $CREATE_CMD" | \
+            sed -e 's/AUTO_INCREMENT=[0-9]*\b//g' \
+                -e 's/^\/\*![0-9]\{5\}.*\/;$//g' \
+                -e 's/CREATE TABLE/CREATE TABLE IF NOT EXISTS/' \
+            >> "$STRUCTURE_FILE"
+        fi
+
+        echo ";" >> "$STRUCTURE_FILE"
+        echo "TRUNCATE TABLE \`$table\`;" >> "$STRUCTURE_FILE"
+        echo "" >> "$STRUCTURE_FILE"
+    done
+
+    # Добавляем завершающие команды
+    echo "SET FOREIGN_KEY_CHECKS=1;" >> "$STRUCTURE_FILE"
+
+    # Импортируем структуры в локальную базу
+    if [ -s "$STRUCTURE_FILE" ]; then
+        echo "📤 Импорт структур таблиц (размер: $(du -h "$STRUCTURE_FILE" | cut -f1))..."
+        ddev import-db --no-drop --src="$STRUCTURE_FILE"
+        rm -f "$STRUCTURE_FILE"
+    else
+        echo "⚠️ Не удалось создать структуры таблиц"
+        rm -f "$STRUCTURE_FILE"
+    fi
+fi
+
+echo "✅ База окружения '$ENVIRONMENT' успешно импортирована! Пустые таблицы созданы."
